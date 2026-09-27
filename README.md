@@ -28,23 +28,33 @@ Students will learn:
 
 ### Local Development (10 minutes)
 
+Requires Docker. Everything else (Kafka, Spark, Python) runs in containers.
+
 ```bash
-# Start local Kafka + Spark environment
-cd local
-docker-compose up -d
+# Start Kafka, Kafka UI, and a Spark container
+make local-up
 
 # Create topics
-./tools/create_topics.sh
+make local-topics
 
-# Run the streaming job
-cd spark/lifecycle_job
-spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-  lifecycle_streaming.py
+# Run the streaming job (leave this running)
+make local-spark
 
-# Start event generator
-cd services/event_generator
-python generator.py --mode normal
+# In another terminal: generate events
+make local-generate                            # normal mode
+make local-generate MODE=duplicate             # resend some events
+make local-generate MODE=late DURATION=300     # hold some ACKs back past the watermark
+
+# Watch the outputs
+./tools/tail_topics.sh cat.lifecycle.v1
+./tools/tail_topics.sh cat.exceptions.v1
+./tools/tail_topics.sh cat.late_events.v1
+
+# Run the tests
+make test
 ```
+
+Kafka UI is at http://localhost:8080 and the Spark UI at http://localhost:4040.
 
 ### AWS Deployment (Serverless)
 

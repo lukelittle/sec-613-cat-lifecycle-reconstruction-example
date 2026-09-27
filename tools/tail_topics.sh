@@ -24,7 +24,9 @@ elif command -v kafkacat &> /dev/null; then
         -o end \
         -f 'Partition: %p | Offset: %o | Key: %k\nValue: %s\n---\n'
 else
-    echo "Error: kcat (or kafkacat) not installed"
-    echo "Install with: brew install kcat (macOS) or apt-get install kafkacat (Linux)"
-    exit 1
+    # Fall back to the console consumer inside the local Kafka container
+    docker exec -it cat-kafka kafka-console-consumer \
+        --bootstrap-server kafka:29092 \
+        --topic "$TOPIC" \
+        --property print.key=true
 fi

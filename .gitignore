@@ -55,3 +55,6 @@ secrets/
 blog/public/
 blog/resources/
 blog/.hugo_build.lock
+
+# Local streaming checkpoints
+local/checkpoints/

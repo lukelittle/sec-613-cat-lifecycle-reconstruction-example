@@ -9,7 +9,7 @@ help:
 	@echo "  make local-up        - Start local Docker environment"
 	@echo "  make local-down      - Stop local Docker environment"
 	@echo "  make local-topics    - Create Kafka topics locally"
-	@echo "  make local-generate  - Run event generator locally"
+	@echo "  make local-generate  - Run event generator locally (MODE=normal|late|duplicate|chaos)"
 	@echo "  make local-spark     - Run Spark job locally"
 	@echo ""
 	@echo "AWS Deployment:"
@@ -42,17 +42,19 @@ local-topics:
 	@echo "Creating Kafka topics..."
 	KAFKA_BROKER=localhost:9092 ./tools/create_topics.sh
 
+MODE ?= normal
+DURATION ?= 60
+
 local-generate:
-	@echo "Running event generator..."
-	cd services/event_generator && \
-	python generator.py --bootstrap-servers localhost:9092 --mode normal --duration 60 --rate 2.0
+	@echo "Running event generator ($(MODE) mode)..."
+	cd local && docker-compose run --rm generator --mode $(MODE) --duration $(DURATION) --rate 2.0
 
 local-spark:
 	@echo "Running Spark job locally..."
-	docker exec -it cat-spark spark-submit \
-		--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-		--conf spark.sql.streaming.checkpointLocation=/opt/spark-checkpoints/lifecycle-job \
-		/opt/spark-apps/lifecycle_streaming.py
+	docker exec -it cat-spark /opt/spark/bin/spark-submit \
+		--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 \
+		--conf spark.jars.ivy=/tmp/.ivy2 \
+		/opt/spark-apps/lifecycle_job/lifecycle_streaming.py
 
 # AWS Deployment
 aws-deploy:
@@ -99,8 +101,9 @@ docs:
 	@echo "Blog post available in blog/posts/"
 
 test:
-	@echo "Running tests..."
-	@echo "No tests implemented yet. See docs/10-exercises.md for test exercises."
+	@echo "Running tests in the Spark container (make local-up first)..."
+	docker exec -e PYTHONPATH=/opt/spark-apps/lifecycle_job:/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip \
+		cat-spark python3 -m unittest discover -s /opt/tests -v
 
 # Quick start commands
 quickstart-local: local-up local-topics

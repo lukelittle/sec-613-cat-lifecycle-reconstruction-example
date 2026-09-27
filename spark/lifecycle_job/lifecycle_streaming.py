@@ -6,17 +6,14 @@ validates data quality, and handles late-arriving events.
 """
 
 import os
-import sys
-import json
-import uuid
-from datetime import datetime
+import hashlib
 from typing import List, Dict, Any
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
     col, from_json, to_json, struct, explode, lit, current_timestamp,
     window, count, sum as _sum, avg, max as _max, min as _min,
-    udf, pandas_udf, PandasUDFType, expr
+    udf, expr
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, LongType,
@@ -54,6 +51,24 @@ def get_config(key: str, default: Any = None) -> Any:
     return os.environ.get(key, default)
 
 
+def use_iam_auth() -> bool:
+    return get_config("USE_IAM_AUTH", "false").lower() == "true"
+
+
+def kafka_options() -> Dict[str, str]:
+    """Connection options shared by every Kafka reader and writer"""
+    options = {"kafka.bootstrap.servers": get_config("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")}
+    if use_iam_auth():
+        options.update({
+            "kafka.security.protocol": "SASL_SSL",
+            "kafka.sasl.mechanism": "AWS_MSK_IAM",
+            "kafka.sasl.jaas.config": "software.amazon.msk.auth.iam.IAMLoginModule required;",
+            "kafka.sasl.client.callback.handler.class":
+                "software.amazon.msk.auth.iam.IAMClientCallbackHandler",
+        })
+    return options
+
+
 def create_spark_session() -> SparkSession:
     """Create and configure Spark session"""
     builder = SparkSession.builder \
@@ -64,12 +79,12 @@ def create_spark_session() -> SparkSession:
         .config("spark.sql.streaming.stateStore.providerClass",
                 "org.apache.spark.sql.execution.streaming.state.HDFSBackedStateStoreProvider")
     
-    # Add Kafka and Iceberg packages if needed
-    packages = [
-        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0",
-        "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3",
-        "software.amazon.msk:aws-msk-iam-auth:2.0.3"
-    ]
+    # Kafka connector always; MSK IAM auth only when running against MSK.
+    # Under spark-submit these only apply if no JVM is running yet, so the
+    # Makefile and deploy script also pass them with --packages / --conf.
+    packages = ["org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0"]
+    if use_iam_auth():
+        packages.append("software.amazon.msk:aws-msk-iam-auth:2.0.3")
     builder = builder.config("spark.jars.packages", ",".join(packages))
     
     spark = builder.getOrCreate()
@@ -81,26 +96,13 @@ def create_spark_session() -> SparkSession:
 def read_events_stream(spark: SparkSession) -> DataFrame:
     """Read raw events from cat.events.v1 Kafka topic"""
     
-    bootstrap_servers = get_config("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    use_iam_auth = get_config("USE_IAM_AUTH", "false").lower() == "true"
-    
-    reader = spark.readStream \
+    raw_stream = spark.readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", bootstrap_servers) \
+        .options(**kafka_options()) \
         .option("subscribe", "cat.events.v1") \
-        .option("startingOffsets", "latest") \
-        .option("failOnDataLoss", "false")
-    
-    if use_iam_auth:
-        reader = reader \
-            .option("kafka.security.protocol", "SASL_SSL") \
-            .option("kafka.sasl.mechanism", "AWS_MSK_IAM") \
-            .option("kafka.sasl.jaas.config",
-                   "software.amazon.msk.auth.iam.IAMLoginModule required;") \
-            .option("kafka.sasl.client.callback.handler.class",
-                   "software.amazon.msk.auth.iam.IAMClientCallbackHandler")
-    
-    raw_stream = reader.load()
+        .option("startingOffsets", get_config("STARTING_OFFSETS", "latest")) \
+        .option("failOnDataLoss", "false") \
+        .load()
     
     # Parse JSON and extract fields
     parsed = raw_stream \
@@ -120,128 +122,96 @@ def read_events_stream(spark: SparkSession) -> DataFrame:
     return with_timestamp
 
 
-def deduplicate_events(events: DataFrame) -> DataFrame:
-    """Remove duplicate events based on event_id (idempotency)"""
-    
-    # Apply watermark for bounded deduplication state
-    deduplicated = events \
-        .withWatermark("event_time", "1 hour") \
-        .dropDuplicates(["event_id"])
-    
-    return deduplicated
+def watermark_delay() -> str:
+    return get_config("WATERMARK_DELAY", "2 minutes")
 
 
 def apply_watermark(events: DataFrame) -> DataFrame:
-    """Apply watermark for late event handling"""
-    
-    watermark_delay = get_config("WATERMARK_DELAY", "30 seconds")
-    
-    watermarked = events \
-        .withWatermark("event_time", watermark_delay)
-    
-    # Tag late events (for audit purposes)
-    watermarked = watermarked \
-        .withColumn("is_late", 
-                   col("kafka_timestamp") > 
-                   col("event_time") + expr(f"INTERVAL {watermark_delay}"))
-    
-    return watermarked
+    """Apply the event-time watermark and tag events that arrived late.
+
+    An event counts as late when it reached Kafka more than the watermark
+    delay after it happened. Stateful operators silently drop events that are
+    behind the watermark, so late events are also routed to their own topic
+    (cat.late_events.v1) for batch reconciliation.
+    """
+    delay = watermark_delay()
+    return events \
+        .withWatermark("event_time", delay) \
+        .withColumn("is_late",
+                    col("kafka_timestamp") > col("event_time") + expr(f"INTERVAL {delay}"))
+
+
+def deduplicate_events(events: DataFrame) -> DataFrame:
+    """Remove duplicate events by event_id (idempotency).
+
+    Deduplicating on event_id plus the watermarked event_time column lets
+    Spark evict each id once the watermark passes it, so state stays
+    bounded. Deduplicating on event_id alone would keep every id forever.
+    A resent event carries the same ts_event, so both keys match.
+
+    (dropDuplicatesWithinWatermark would be the natural choice, but in
+    Spark 3.5 it fails at runtime once downstream projections prune columns.)
+    """
+    return events.dropDuplicates(["event_id", "event_time"])
+
+
+EDGE_SCHEMA = ArrayType(StructType([
+    StructField("edge_id", StringType()),
+    StructField("edge_type", StringType()),
+    StructField("source_id", StringType()),
+    StructField("target_id", StringType()),
+    StructField("customer_order_id", StringType()),
+    StructField("ts_event", LongType())
+]))
+
+
+def edges_for_event(event_id, event_type, customer_order_id, firm_order_id,
+                    parent_firm_order_id, route_id, exec_id, ts_event) -> List[Dict[str, Any]]:
+    """Parent-child edges implied by one event.
+
+    Edge ids are derived from the event, so replaying the same event produces
+    the same edges instead of new random ids.
+    """
+    pairs = []
+    if event_type == "NEW":
+        pairs.append(("ROOT", customer_order_id, firm_order_id))
+    elif event_type == "ROUTE":
+        if parent_firm_order_id:
+            pairs.append(("ROUTE", parent_firm_order_id, firm_order_id))
+        if route_id:
+            pairs.append(("ROUTE", firm_order_id, route_id))
+    elif event_type == "FILL":
+        if route_id and exec_id:
+            pairs.append(("FILL", route_id, exec_id))
+    elif event_type == "REPLACE":
+        if parent_firm_order_id:
+            pairs.append(("REPLACE", parent_firm_order_id, firm_order_id))
+    elif event_type == "CANCEL":
+        pairs.append(("CANCEL", firm_order_id, f"CANCEL-{firm_order_id}"))
+    elif event_type == "BUST":
+        if exec_id:
+            pairs.append(("BUST", exec_id, f"BUST-{exec_id}"))
+
+    edges = []
+    for i, (edge_type, source_id, target_id) in enumerate(pairs):
+        digest = hashlib.sha256(f"{event_id}:{i}:{edge_type}".encode()).hexdigest()[:32]
+        edges.append({
+            "edge_id": digest,
+            "edge_type": edge_type,
+            "source_id": source_id,
+            "target_id": target_id,
+            "customer_order_id": customer_order_id,
+            "ts_event": ts_event,
+        })
+    return edges
 
 
 def build_linkages(events: DataFrame) -> DataFrame:
-    """Construct parent-child edges from events"""
-    
-    edge_schema = ArrayType(StructType([
-        StructField("edge_id", StringType()),
-        StructField("edge_type", StringType()),
-        StructField("source_id", StringType()),
-        StructField("target_id", StringType()),
-        StructField("customer_order_id", StringType()),
-        StructField("ts_event", LongType())
-    ]))
-    
-    @udf(edge_schema)
-    def construct_edges(event_type, customer_order_id, firm_order_id, 
-                       parent_firm_order_id, route_id, exec_id, ts_event):
-        edges = []
-        
-        if event_type == "NEW":
-            edges.append({
-                "edge_id": str(uuid.uuid4()),
-                "edge_type": "ROOT",
-                "source_id": customer_order_id,
-                "target_id": firm_order_id,
-                "customer_order_id": customer_order_id,
-                "ts_event": ts_event
-            })
-        
-        elif event_type == "ROUTE":
-            if parent_firm_order_id:
-                edges.append({
-                    "edge_id": str(uuid.uuid4()),
-                    "edge_type": "ROUTE",
-                    "source_id": parent_firm_order_id,
-                    "target_id": firm_order_id,
-                    "customer_order_id": customer_order_id,
-                    "ts_event": ts_event
-                })
-            if route_id:
-                edges.append({
-                    "edge_id": str(uuid.uuid4()),
-                    "edge_type": "ROUTE",
-                    "source_id": firm_order_id,
-                    "target_id": route_id,
-                    "customer_order_id": customer_order_id,
-                    "ts_event": ts_event
-                })
-        
-        elif event_type == "FILL":
-            if route_id and exec_id:
-                edges.append({
-                    "edge_id": str(uuid.uuid4()),
-                    "edge_type": "FILL",
-                    "source_id": route_id,
-                    "target_id": exec_id,
-                    "customer_order_id": customer_order_id,
-                    "ts_event": ts_event
-                })
-        
-        elif event_type == "REPLACE":
-            if parent_firm_order_id:
-                edges.append({
-                    "edge_id": str(uuid.uuid4()),
-                    "edge_type": "REPLACE",
-                    "source_id": parent_firm_order_id,
-                    "target_id": firm_order_id,
-                    "customer_order_id": customer_order_id,
-                    "ts_event": ts_event
-                })
-        
-        elif event_type == "CANCEL":
-            edges.append({
-                "edge_id": str(uuid.uuid4()),
-                "edge_type": "CANCEL",
-                "source_id": firm_order_id,
-                "target_id": f"CANCEL-{firm_order_id}",
-                "customer_order_id": customer_order_id,
-                "ts_event": ts_event
-            })
-        
-        elif event_type == "BUST":
-            if exec_id:
-                edges.append({
-                    "edge_id": str(uuid.uuid4()),
-                    "edge_type": "BUST",
-                    "source_id": exec_id,
-                    "target_id": f"BUST-{exec_id}",
-                    "customer_order_id": customer_order_id,
-                    "ts_event": ts_event
-                })
-        
-        return edges
-    
-    linkages = events \
+    """Construct parent-child edges from events (stateless, append mode)"""
+    construct_edges = udf(edges_for_event, EDGE_SCHEMA)
+    return events \
         .withColumn("edges", construct_edges(
+            col("event_id"),
             col("event_type"),
             col("customer_order_id"),
             col("firm_order_id"),
@@ -252,26 +222,35 @@ def build_linkages(events: DataFrame) -> DataFrame:
         )) \
         .select(explode(col("edges")).alias("edge")) \
         .select("edge.*")
-    
-    return linkages
 
 
 def materialize_lifecycles(events: DataFrame) -> DataFrame:
     """Aggregate events into lifecycle snapshots"""
     
-    # Use stateful aggregation with custom logic
+    # Grouping by trading day as well as order id lets the watermark close
+    # each day and evict its state. Without an event-time key, state would
+    # grow forever. (Orders that live across days, like GTC, would need
+    # arbitrary stateful processing instead; see docs/10-exercises.md.)
     lifecycle_agg = events \
-        .groupBy("customer_order_id") \
+        .groupBy(window(col("event_time"), "1 day").alias("trade_date_window"),
+                 col("customer_order_id")) \
         .agg(
-            _max(struct(col("event_type"), col("ts_event"))).alias("last_event"),
+            # ts_event first so max() picks the latest event, not the
+            # alphabetically largest event type
+            _max(struct(col("ts_event"), col("event_type"))).alias("last_event"),
             _min("ts_event").alias("ts_first_event"),
             _max("ts_event").alias("ts_last_event"),
             _max(col("firm_order_id")).alias("root_firm_order_id"),
             _max(col("account_id")).alias("account_id"),
             _max(col("symbol")).alias("symbol"),
             _max(col("side")).alias("side"),
-            _max(col("qty")).alias("total_qty"),
-            _sum(expr("CASE WHEN event_type = 'FILL' THEN qty ELSE 0 END")).alias("filled_qty"),
+            # Order quantity comes from the NEW event; taking max(qty) across
+            # all events would hide overfills
+            _max(expr("CASE WHEN event_type = 'NEW' THEN qty END")).alias("total_qty"),
+            # Busts reverse fills
+            _sum(expr("""CASE WHEN event_type = 'FILL' THEN qty
+                              WHEN event_type = 'BUST' THEN -qty
+                              ELSE 0 END""")).alias("filled_qty"),
             avg(expr("CASE WHEN event_type = 'FILL' THEN exec_price ELSE NULL END")).alias("avg_exec_price"),
             count(expr("CASE WHEN event_type = 'ROUTE' THEN 1 END")).alias("route_count"),
             count(expr("CASE WHEN event_type = 'FILL' THEN 1 END")).alias("fill_count"),
@@ -292,87 +271,84 @@ def materialize_lifecycles(events: DataFrame) -> DataFrame:
                        END
                    """)) \
         .withColumn("is_provisional", col("has_late_events")) \
-        .withColumn("ts_snapshot", (current_timestamp().cast("long") * 1000))
+        .withColumn("trade_date", col("trade_date_window.start").cast("date").cast("string")) \
+        .withColumn("ts_snapshot", (current_timestamp().cast("long") * 1000)) \
+        .drop("trade_date_window")
     
     return lifecycles
 
 
 def validate_lifecycles(lifecycles: DataFrame) -> DataFrame:
-    """Detect data quality exceptions"""
-    
-    # Exception 1: Overfill
-    overfill = lifecycles \
-        .filter(col("filled_qty") > col("total_qty")) \
-        .select(
-            lit(str(uuid.uuid4())).alias("exception_id"),
-            lit("OVERFILL").alias("exception_type"),
-            lit("ERROR").alias("severity"),
-            col("customer_order_id"),
-            col("root_firm_order_id").alias("firm_order_id"),
-            lit("Filled quantity exceeds total quantity").alias("description"),
-            (current_timestamp().cast("long") * 1000).alias("ts_detected"),
-            struct(
-                col("total_qty"),
-                col("filled_qty")
-            ).alias("metadata")
-        )
-    
-    # Exception 2: Negative fill
-    negative_fill = lifecycles \
-        .filter(col("filled_qty") < 0) \
-        .select(
-            lit(str(uuid.uuid4())).alias("exception_id"),
-            lit("NEGATIVE_FILL").alias("exception_type"),
-            lit("ERROR").alias("severity"),
-            col("customer_order_id"),
-            col("root_firm_order_id").alias("firm_order_id"),
-            lit("Negative filled quantity").alias("description"),
-            (current_timestamp().cast("long") * 1000).alias("ts_detected"),
-            struct(col("filled_qty")).alias("metadata")
-        )
-    
-    # Union all exceptions
-    all_exceptions = overfill.union(negative_fill)
-    
-    return all_exceptions
+    """Detect data quality exceptions in a batch of lifecycle snapshots.
+
+    Runs inside foreachBatch on each micro-batch of updated lifecycles, so it
+    works on a plain (non-streaming) DataFrame.
+    """
+    def exceptions(condition, exception_type, description, metadata):
+        return lifecycles \
+            .filter(condition) \
+            .select(
+                expr("uuid()").alias("exception_id"),
+                lit(exception_type).alias("exception_type"),
+                lit("ERROR").alias("severity"),
+                col("customer_order_id"),
+                col("root_firm_order_id").alias("firm_order_id"),
+                lit(description).alias("description"),
+                (current_timestamp().cast("long") * 1000).alias("ts_detected"),
+                to_json(metadata).alias("metadata")
+            )
+
+    overfill = exceptions(col("filled_qty") > col("total_qty"), "OVERFILL",
+                          "Filled quantity exceeds total quantity",
+                          struct(col("total_qty"), col("filled_qty")))
+    negative_fill = exceptions(col("filled_qty") < 0, "NEGATIVE_FILL",
+                               "Negative filled quantity (more busted than filled)",
+                               struct(col("total_qty"), col("filled_qty")))
+    return overfill.unionByName(negative_fill)
+
+
+def checkpoint(name: str) -> str:
+    return f"{get_config('CHECKPOINT_LOCATION', '/tmp/checkpoints')}/{name}"
 
 
 def write_to_kafka(df: DataFrame, topic: str, checkpoint_suffix: str):
-    """Write DataFrame to Kafka topic"""
-    
-    bootstrap_servers = get_config("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    checkpoint_base = get_config("CHECKPOINT_LOCATION", "/tmp/checkpoints")
-    
-    query = df \
+    """Write a stateless stream to a Kafka topic (append mode)"""
+    return df \
         .select(to_json(struct("*")).alias("value")) \
         .writeStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", bootstrap_servers) \
+        .options(**kafka_options()) \
         .option("topic", topic) \
-        .option("checkpointLocation", f"{checkpoint_base}/{checkpoint_suffix}") \
+        .option("checkpointLocation", checkpoint(checkpoint_suffix)) \
         .outputMode("append") \
         .start()
-    
-    return query
 
 
-def write_lifecycles_to_kafka(lifecycles: DataFrame):
-    """Write lifecycle snapshots to Kafka (update mode)"""
-    
-    bootstrap_servers = get_config("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    checkpoint_base = get_config("CHECKPOINT_LOCATION", "/tmp/checkpoints")
-    
-    query = lifecycles \
-        .select(to_json(struct("*")).alias("value")) \
+def write_lifecycles_and_exceptions(lifecycles: DataFrame):
+    """Write updated lifecycles, and the exceptions found in them, per micro-batch.
+
+    Exceptions are derived from an aggregation, which Spark can't emit in
+    append mode, so both outputs are written from foreachBatch in update mode.
+    """
+    def write_batch(batch: DataFrame, batch_id: int):
+        batch.persist()
+        for df, topic in ((batch, "cat.lifecycle.v1"),
+                          (validate_lifecycles(batch), "cat.exceptions.v1")):
+            df.select(col("customer_order_id").alias("key"),
+                      to_json(struct("*")).alias("value")) \
+                .write \
+                .format("kafka") \
+                .options(**kafka_options()) \
+                .option("topic", topic) \
+                .save()
+        batch.unpersist()
+
+    return lifecycles \
         .writeStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", bootstrap_servers) \
-        .option("topic", "cat.lifecycle.v1") \
-        .option("checkpointLocation", f"{checkpoint_base}/lifecycle") \
+        .foreachBatch(write_batch) \
+        .option("checkpointLocation", checkpoint("lifecycle")) \
         .outputMode("update") \
         .start()
-    
-    return query
 
 
 def write_to_console(df: DataFrame, name: str):
@@ -381,7 +357,7 @@ def write_to_console(df: DataFrame, name: str):
     query = df \
         .writeStream \
         .format("console") \
-        .outputMode("append") \
+        .outputMode("update") \
         .option("truncate", "false") \
         .start()
     
@@ -400,40 +376,39 @@ def main():
     print("Reading events from Kafka...")
     events = read_events_stream(spark)
     
+    # Watermark first, so dedup and aggregation state are bounded
+    print("Applying watermark...")
+    watermarked = apply_watermark(events)
+
     # Deduplicate
     print("Applying deduplication...")
-    unique_events = deduplicate_events(events)
-    
-    # Apply watermark
-    print("Applying watermark...")
-    watermarked = apply_watermark(unique_events)
-    
+    unique_events = deduplicate_events(watermarked)
+
     # Build linkages
     print("Building linkages...")
-    linkages = build_linkages(watermarked)
-    
+    linkages = build_linkages(unique_events)
+
     # Materialize lifecycles
     print("Materializing lifecycles...")
-    lifecycles = materialize_lifecycles(watermarked)
-    
-    # Validate
-    print("Validating lifecycles...")
-    exceptions = validate_lifecycles(lifecycles)
-    
+    lifecycles = materialize_lifecycles(unique_events)
+
     # Write outputs
     print("Starting output streams...")
-    
+
     queries = []
-    
-    # Write linkages
+
+    # Linkages (stateless)
     queries.append(write_to_kafka(linkages, "cat.linkages.v1", "linkages"))
-    
-    # Write lifecycles
-    queries.append(write_lifecycles_to_kafka(lifecycles))
-    
-    # Write exceptions
-    queries.append(write_to_kafka(exceptions, "cat.exceptions.v1", "exceptions"))
-    
+
+    # Lifecycles and the exceptions detected in them
+    queries.append(write_lifecycles_and_exceptions(lifecycles))
+
+    # Late events, for batch reconciliation (read before the stateful
+    # operators, which drop events behind the watermark)
+    late_events = watermarked.filter(col("is_late")) \
+        .drop("kafka_timestamp", "partition", "offset", "event_time")
+    queries.append(write_to_kafka(late_events, "cat.late_events.v1", "late_events"))
+
     # Optional: Console output for debugging
     if get_config("DEBUG_MODE", "false").lower() == "true":
         queries.append(write_to_console(lifecycles, "lifecycles"))

@@ -50,29 +50,39 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
 
+  # Official Apache Spark image (the bitnami/spark image is no longer published).
+  # It idles; `make local-spark` runs the job inside it with spark-submit.
   spark:
-    image: bitnami/spark:3.5.0
+    image: spark:3.5.3-python3
     container_name: cat-spark
     depends_on:
       - kafka
+    user: root
     ports:
       - "4040:4040"
-      - "8081:8081"
     environment:
-      - SPARK_MODE=master
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      CHECKPOINT_LOCATION: /opt/spark-checkpoints/lifecycle-job
+      HOME: /tmp
     volumes:
-      - ./spark:/opt/spark-apps
-      - ./data:/opt/spark-data
+      - ../spark:/opt/spark-apps
+      - ../tests:/opt/tests
       - ./checkpoints:/opt/spark-checkpoints
-    command: >
-      bash -c "
-      pip install kafka-python &&
-      /opt/bitnami/scripts/spark/entrypoint.sh /opt/bitnami/scripts/spark/run.sh
-      "
+    command: ["sleep", "infinity"]
+
+  # Event generator, run on demand: `make local-generate`
+  generator:
+    image: python:3.11-slim
+    container_name: cat-generator
+    profiles: ["tools"]
+    depends_on:
+      - kafka
+    working_dir: /app
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ../services/event_generator:/app
+    entrypoint: ["sh", "-c", "pip install -q -r requirements.txt && python generator.py --bootstrap-servers kafka:29092 \"$$@\"", "--"]
 
 volumes:
   zookeeper-data:

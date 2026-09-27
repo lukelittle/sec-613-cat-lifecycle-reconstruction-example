@@ -181,9 +181,9 @@ class EventGenerator:
             ack_event["venue"] = venue
             ack_event["ts_event"] = base_ts + (i + 1) * 100 + 50
             
-            # In late mode, delay some ACKs
+            # In late mode, hold back some ACKs: they keep their original
+            # event time but are sent later, so they arrive late
             if self.mode == "late" and random.random() < 0.3:
-                ack_event["ts_event"] = base_ts + 60000  # 60 seconds late
                 self.late_event_buffer.append(ack_event)
             else:
                 events.append(ack_event)
@@ -306,8 +306,12 @@ class EventGenerator:
                 self.send_event(event)
                 event_count += 1
             
-            # Send buffered late events
-            if self.late_event_buffer and random.random() < 0.1:
+            # Send buffered late events once they're older than the
+            # watermark delay (LATE_AFTER_SECONDS, default 150s)
+            late_after_ms = int(os.environ.get("LATE_AFTER_SECONDS", "150")) * 1000
+            now_ms = int(time.time() * 1000)
+            while self.late_event_buffer and \
+                    now_ms - self.late_event_buffer[0]["ts_event"] > late_after_ms:
                 late_event = self.late_event_buffer.pop(0)
                 late_event["ts_ingest"] = int(time.time() * 1000)
                 self.send_event(late_event)
@@ -317,6 +321,13 @@ class EventGenerator:
             # Rate limiting
             time.sleep(1.0 / events_per_second)
         
+        # Anything still held back goes out now (late by however long the run was)
+        for late_event in self.late_event_buffer:
+            late_event["ts_ingest"] = int(time.time() * 1000)
+            self.send_event(late_event)
+            event_count += 1
+        self.late_event_buffer.clear()
+
         if self.producer:
             self.producer.flush()
         

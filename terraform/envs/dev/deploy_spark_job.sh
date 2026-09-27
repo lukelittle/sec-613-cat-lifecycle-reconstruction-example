@@ -28,7 +28,7 @@ JOB_RUN_ID=$(aws emr-serverless start-job-run \
   --job-driver '{
     "sparkSubmit": {
       "entryPoint": "s3://'$S3_BUCKET'/spark-jobs/lifecycle_streaming.py",
-      "sparkSubmitParameters": "--conf spark.jars.packages=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,software.amazon.msk:aws-msk-iam-auth:2.0.3 --conf spark.sql.streaming.checkpointLocation=s3://'$S3_BUCKET'/checkpoints/lifecycle-job --conf spark.executor.memory=4g --conf spark.driver.memory=2g --conf spark.sql.shuffle.partitions=6"
+      "sparkSubmitParameters": "--conf spark.jars.packages=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,software.amazon.msk:aws-msk-iam-auth:2.0.3 --conf spark.emr-serverless.driverEnv.KAFKA_BOOTSTRAP_SERVERS='$MSK_BOOTSTRAP' --conf spark.emr-serverless.driverEnv.USE_IAM_AUTH=true --conf spark.emr-serverless.driverEnv.CHECKPOINT_LOCATION=s3://'$S3_BUCKET'/checkpoints/lifecycle-job --conf spark.executorEnv.KAFKA_BOOTSTRAP_SERVERS='$MSK_BOOTSTRAP' --conf spark.executorEnv.USE_IAM_AUTH=true --conf spark.sql.streaming.checkpointLocation=s3://'$S3_BUCKET'/checkpoints/lifecycle-job --conf spark.executor.memory=4g --conf spark.driver.memory=2g --conf spark.sql.shuffle.partitions=6"
     }
   }' \
   --configuration-overrides '{
